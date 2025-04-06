@@ -372,14 +372,10 @@ export function highlightExtension(
 }
 
 // Helper function to create a new highlight
-export function createHighlight(view: EditorView) {
+export function createHighlight(view: EditorView, selectedText: string) {
 	const selection = view.state.selection.main;
 	if (selection.empty) return false;
 
-	const selectedText = view.state.doc.sliceString(
-		selection.from,
-		selection.to
-	);
 	const highlightText = `==${selectedText}==`;
 
 	const transaction = view.state.update({
