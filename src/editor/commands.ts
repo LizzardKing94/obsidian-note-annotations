@@ -36,7 +36,7 @@ export async function createHighlightCommand(
 
 	// @ts-expect-error, not typed
 	const editorView = editor.cm as EditorView;
-	createHighlight(editorView);
+	createHighlight(editorView, selectedText);
 }
 
 function expandSelectionBoundary(editor: Editor) {
