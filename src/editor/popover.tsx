@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
-import { setIcon } from "obsidian";
-import { Notice } from "obsidian";
+import ReactDOM from "react-dom/client";
+import { setIcon, Notice } from "obsidian";
 import { cn } from "@/lib/utils";
 
 interface CommentPopoverProps {
@@ -9,21 +9,9 @@ interface CommentPopoverProps {
 	colorOptions: string[];
 	className: string;
 	highlightText: string;
-	onSave: ({
-		comment,
-		remove,
-	}: {
-		comment?: string;
-		remove?: boolean;
-	}) => void;
+	onSave: ({ comment, remove }: { comment?: string; remove?: boolean }) => void;
 	addNewFileFn: () => void;
-	popoverRef: HTMLElement;
-}
-
-declare module "react" {
-	interface HTMLAttributes<T> extends AriaAttributes, DOMAttributes<T> {
-		popover?: "auto" | "manual";
-	}
+	popoverRef: { hidePopover: () => void };
 }
 
 const Popover = ({
@@ -76,33 +64,30 @@ const Popover = ({
 			new Notice("Comment must not contain empty lines");
 			return;
 		}
+		if (remove) {
+			onSave({ remove: true, comment: '' });
+			return;
+		}
+		// combine color + comment
+		const finalComment = comment.trim() + (selectedColor ? ` @${selectedColor}` : "");
+		onSave({ comment: finalComment, remove });
 		popoverRef.hidePopover();
-		const newComment =
-			comment.trim() + (selectedColor ? ` @${selectedColor}` : "");
-		onSave({
-			comment: newComment,
-			remove,
-		});
 	};
 
 	return (
 		<div
 			className={cn(
 				className,
-				"rounded-lg border border-solid border-gray-200 bg-white p-0 shadow-lg",
+				"rounded-lg border border-solid border-gray-200 bg-white p-0 shadow-lg"
 			)}
 		>
 			<div
 				className="flex justify-between bg-gray-50"
-				style={{
-					borderBottom: "1px solid var(--background-modifier-border)",
-				}}
+				style={{ borderBottom: "1px solid var(--background-modifier-border)" }}
 			>
 				<button
 					type="button"
-					onClick={() => {
-						handleSubmit({ remove: true });
-					}}
+					onClick={() => handleSubmit({ remove: true })}
 					className={cn(
 						"flex !bg-transparent px-2 py-1 text-xs !shadow-none hover:bg-transparent hover:underline",
 						showCommentForm ? "justify-around" : "justify-end",
@@ -116,7 +101,7 @@ const Popover = ({
 					<button
 						type="button"
 						onClick={() => {
-							popoverRef.hidePopover();
+							hidePopover();
 							navigator.clipboard.writeText(highlightText);
 							new Notice("Copied to clipboard");
 						}}
@@ -129,31 +114,25 @@ const Popover = ({
 					<button
 						type="button"
 						onClick={() => {
-							popoverRef.hidePopover();
+							hidePopover();
 							addNewFileFn();
 						}}
 						className="clickable-icon"
 						ref={newFileButtonRef}
 						title="Extract highlighted text to new file"
 					>
-						<span className="sr-only">
-							Extract highlighted text to new file
-						</span>
+						<span className="sr-only">Extract highlighted text to new file</span>
 					</button>
 					{!showCommentForm && (
 						<button
 							type="button"
 							onClick={() => {
-								setShowCommentForm(!showCommentForm);
+								setShowCommentForm(true);
 								setTimeout(() => {
 									if (inputRef.current) {
 										inputRef.current.focus();
-										const length =
-											inputRef.current.value.length;
-										inputRef.current.setSelectionRange(
-											length,
-											length,
-										);
+										const length = inputRef.current.value.length;
+										inputRef.current.setSelectionRange(length, length);
 									}
 								});
 							}}
@@ -197,17 +176,13 @@ const Popover = ({
 					<div className="flex flex-1 items-center gap-x-2">
 						<ColorButton
 							color={null}
-							onClickHandler={() => {
-								handleSubmit({ selectedColor: null });
-							}}
+							onClickHandler={() => handleSubmit({ selectedColor: null })}
 						/>
-						{colorOptions.map((color) => (
+						{colorOptions.map((c) => (
 							<ColorButton
-								key={color}
-								color={color}
-								onClickHandler={(color) => {
-									handleSubmit({ selectedColor: color });
-								}}
+								key={c}
+								color={c}
+								onClickHandler={(col) => handleSubmit({ selectedColor: col })}
 							/>
 						))}
 					</div>
@@ -236,5 +211,52 @@ const ColorButton = ({
 );
 
 Popover.displayName = "Popover";
-
 export default Popover;
+
+/**
+ * Show the popover at screen coords, for reading mode
+ */
+export function showCommentPopoverAtCoords(
+  coords: { x: number; y: number },
+  highlightText: string,
+  options: {
+    initialComment?: string;
+    initialColor?: string;
+    colorOptions?: string[];
+    className?: string;
+    onSave?: ({ comment, remove }: { comment?: string; remove?: boolean }) => void;
+    addNewFileFn?: () => void;
+  } = {}
+) {
+  const container = document.createElement("div");
+  container.id = "omnidian-comment-popover-container";
+  container.style.position = "absolute";
+  container.style.left = `${coords.x}px`;
+  container.style.top = `${coords.y}px`;
+  container.style.zIndex = "9999";
+  document.body.appendChild(container);
+
+  const root = ReactDOM.createRoot(container);
+
+  const popoverRef = {
+    hidePopover: () => {
+      root.unmount();
+      container.remove();
+    },
+  };
+
+  root.render(
+    <Popover
+      popoverRef={popoverRef}
+      highlightText={highlightText}
+      initialComment={options.initialComment || ""}
+      initialColor={options.initialColor || ""}
+      colorOptions={options.colorOptions || ["lightpink", "palegreen", "paleturquoise", "violet"]}
+      className={options.className || ""}
+	  onSave={options.onSave || (() => {})}
+      addNewFileFn={options.addNewFileFn || (() => { /* no-op */ })}
+    />
+  );
+
+  return container;
+}
