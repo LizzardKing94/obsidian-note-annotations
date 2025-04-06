@@ -1,163 +1,211 @@
 import { Notice, Plugin } from "obsidian";
-
-import {
-	highlightExtension,
-	cleanup as cleanupPopover,
-} from "./editor/extension";
 import { OmnidianSettingTab } from "@/settings";
-import { createHighlightCommand } from "@/editor/commands";
-import postprocessor from "@/preview/postprocessor";
+import postprocessor from "@/preview/postprocessor"; // We'll rely on this to attach click handlers to .omnidian-highlight
+import { showCommentPopoverAtCoords } from "@/editor/popover";
 import "../manifest.json";
 
+import { unified } from "unified";
+import remarkParse from "remark-parse";
+import { visit } from "unist-util-visit";
+import type { Literal } from "unist";
+
+let currentPopover: HTMLElement | null = null;
+
+/**
+ * Use a Markdown AST to find the exact offset of selected text in the file.
+ */
+async function findExactOffsetInMarkdown(markdown: string, selectedText: string): Promise<{ start: number; end: number } | null> {
+  const tree = unified().use(remarkParse).parse(markdown);
+
+  let match: { start: number; end: number } | null = null;
+
+  visit(tree, "text", (node: Literal) => {
+    if (!node.value || !node.position) return;
+
+    const textValue = node.value as string;
+    const index = textValue.indexOf(selectedText);
+    if (index !== -1) {
+      const nodeOffset = node.position.start.offset ?? 0;
+      match = {
+        start: nodeOffset + index,
+        end: nodeOffset + index + selectedText.length,
+      };
+    }
+  });
+
+  return match;
+}
+
 export interface OmnidianSettings {
-	expandSelection: boolean;
-	colors: string[];
+  expandSelection: boolean;
+  colors: string[];
 }
 
 const DEFAULT_SETTINGS: OmnidianSettings = {
-	expandSelection: true,
-	colors: ["lightpink", "palegreen", "paleturquoise", "violet"],
+  expandSelection: true,
+  colors: ["lightpink", "palegreen", "paleturquoise", "violet"],
 };
 
 export default class OmnidianPlugin extends Plugin {
-	settings: OmnidianSettings = DEFAULT_SETTINGS;
-	isModalOpen = false;
-	isHighlightingModeOn = false;
-	statusBarItemEl: HTMLElement | null = null;
+  settings: OmnidianSettings = DEFAULT_SETTINGS;
+  isHighlightingModeOn = false;
+  statusBarItemEl: HTMLElement | null = null;
 
-	async onload() {
-		await this.loadSettings();
+  async onload() {
+    await this.loadSettings();
 
-		// Icon in the left ribbon to toggle comment mode
-		this.addRibbonIcon(
-			"highlighter",
-			`${
-				this.isHighlightingModeOn ? "Disable" : "Enable"
-			} highlighting mode`,
-			() => {
-				this.toggleHighlightingMode();
-			},
-		);
+    // Ribbon icon to toggle highlight mode
+    this.addRibbonIcon(
+      "highlighter",
+      `${this.isHighlightingModeOn ? "Disable" : "Enable"} highlighting mode`,
+      () => {
+        this.toggleHighlightingMode();
+      },
+    );
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		this.addStatusBarModeIndicator();
+    // Status bar item
+    this.addStatusBarModeIndicator();
 
-		// Add the comment extension to CodeMirror
-		this.registerEditorExtension([
-			highlightExtension(this.settings.colors, [
-				this.app.workspace.getActiveFile()?.basename,
-				async (path: string, data: string) => {
-					const newFile = await this.app.vault.create(path, data);
-					this.app.workspace.openLinkText("", newFile.path);
-				},
-			]),
-		]);
+    // Settings tab
+    this.addSettingTab(new OmnidianSettingTab(this.app, this));
 
-		this.addCommand({
-			id: "create-highlight",
-			name: "Highlight selection",
-			editorCallback: (editor) =>
-				createHighlightCommand(editor, this.settings.expandSelection),
-		});
+    // Postprocessor for reading-mode highlight clicks
+    this.registerMarkdownPostProcessor(postprocessor);
 
-		this.addCommand({
-			id: "toggle-highlighting-mode",
-			name: "Toggle highlight mode",
-			editorCallback: () => this.toggleHighlightingMode(),
-		});
+    // Close any open popover if user clicks outside it
+    document.addEventListener("mousedown", (e) => {
+      if (currentPopover && !currentPopover.contains(e.target as Node)) {
+        currentPopover.remove();
+        currentPopover = null;
+      }
+    });
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new OmnidianSettingTab(this.app, this));
+    // Listen for highlight clicks (custom event)
+    document.addEventListener("omnidian-show-popover", async (evt: Event) => {
+      const { coords, text } = (evt as CustomEvent).detail;
 
-		// prevent any other editor actions when in highlighting mode
-		this.registerDomEvent(
-			document,
-			"mousedown",
-			this.lockEditorInHighlightingModeEventHandler,
-		);
-		this.registerDomEvent(
-			document,
-			"touchstart",
-			this.lockEditorInHighlightingModeEventHandler,
-		);
-		// highlight selected text when in annotate mode
-		this.registerDomEvent(document, "mouseup", this.highlightEventHandler);
-		this.registerDomEvent(document, "touchend", this.highlightEventHandler);
+      if (currentPopover) {
+        currentPopover.remove();
+        currentPopover = null;
+      }
 
-		this.registerMarkdownPostProcessor(postprocessor);
-	}
+      const file = this.app.workspace.getActiveFile();
+      if (!file) return;
 
-	lockEditorInHighlightingModeEventHandler = (e: MouseEvent | TouchEvent) => {
-		if (
-			this.isHighlightingModeOn &&
-			e.target instanceof HTMLElement &&
-			e.target.closest(".is-live-preview") &&
-			!(
-				e.target.closest("#omnidian-comment-popover-container") ||
-				e.target.closest("#omnidian-comment-popover")
-			)
-		) {
-			e.preventDefault();
-			this.app.workspace.activeEditor?.editor?.blur();
-		}
-	};
+      const rawText = await this.app.vault.read(file);
 
-	highlightEventHandler = async (e: MouseEvent | TouchEvent) => {
-		const editor = this.app.workspace.activeEditor?.editor;
-		const selection = editor?.getSelection();
+      // Check if there's an existing comment
+      const match = rawText.match(new RegExp(`==${text}==(?:<!--(.*?)-->)?`));
+      let foundComment = match?.[1]?.trim();
+      let foundColor: string | undefined;
+      if (foundComment) {
+        const colorMatch = foundComment.match(/@([\w-]+)/);
+        foundColor = colorMatch?.[1] ?? undefined;
+        if (foundColor) {
+          foundComment = foundComment.replace(`@${foundColor}`, "").trim();
+        }
+      }
 
-		if (!editor || !selection) return;
+      // Show popover
+      const container = showCommentPopoverAtCoords(coords, text, {
+        onSave: ({  }) => {
+          // Handle save logic here
+        },
+      });
 
-		// require modifier key when not in annotate mode
-		if (!(e.metaKey || e.altKey) && !this.isHighlightingModeOn) return;
+      currentPopover = container;
+    });
 
-		if (
-			e.target instanceof HTMLElement &&
-			!e.target.closest(".is-live-preview")
-		) {
-			return;
-		}
+    // Reading mode highlight
+    this.registerDomEvent(document, "mouseup", this.handleReadingModeHighlight);
+    this.registerDomEvent(document, "touchend", this.handleReadingModeHighlight);
+  }
 
-		const expandSelection = this.settings.expandSelection && !e.altKey;
+  handleReadingModeHighlight = async (e: MouseEvent | TouchEvent) => {
+    if (!this.isHighlightingModeOn) return;
 
-		createHighlightCommand(editor, expandSelection);
-	};
+    const target = e.target instanceof HTMLElement ? e.target : null;
+    if (!target || !target.closest(".markdown-preview-view,.markdown-reading-view")) {
+      return;
+    }
 
-	toggleHighlightingMode() {
-		this.isHighlightingModeOn = !this.isHighlightingModeOn;
-		this.statusBarItemEl?.setText(
-			`Highlighting mode: ${this.isHighlightingModeOn}`,
-		);
-		new Notice(
-			`Highlighting mode ${
-				this.isHighlightingModeOn ? "enabled" : "disabled"
-			}`,
-		);
-	}
+    const domSelection = window.getSelection();
+    if (!domSelection || domSelection.rangeCount === 0) return;
 
-	addStatusBarModeIndicator() {
-		this.statusBarItemEl = this.addStatusBarItem();
-		this.statusBarItemEl.setText(
-			`Highlighting mode: ${this.isHighlightingModeOn}`,
-		);
-		this.statusBarItemEl.addEventListener("click", () =>
-			this.toggleHighlightingMode(),
-		);
-	}
+    const selectedText = domSelection.toString().trim();
+    if (!selectedText) return;
 
-	onunload() {
-		cleanupPopover();
-	}
+    const file = this.app.workspace.getActiveFile();
+    if (!file) {
+      new Notice("No active file found to highlight.");
+      return;
+    }
 
-	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			await this.loadData(),
-		);
-	}
+    let rawText = await this.app.vault.read(file);
 
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
+    const match = await findExactOffsetInMarkdown(rawText, selectedText);
+    let noticeMessage: string;
+    if (!match) {
+      rawText = `==${selectedText}==\n${rawText}`;
+      noticeMessage = "Could not find the exact text; highlight inserted at top of file.";
+    } else {
+      const before = rawText.slice(0, match.start);
+      const after = rawText.slice(match.end);
+      rawText = `${before}==${selectedText}==${after}`;
+      noticeMessage = `Highlighted text: "${selectedText}"`;
+    }
+
+    await this.app.vault.modify(file, rawText);
+    await this.app.workspace.getLeaf().openFile(file, { state: { mode: "preview" } });
+    new Notice(noticeMessage);
+
+    const range = domSelection.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    if (!rect) return;
+
+    if (currentPopover) {
+      currentPopover.remove();
+      currentPopover = null;
+    }
+
+    const container = showCommentPopoverAtCoords(
+      { x: rect.left + window.scrollX, y: rect.top + window.scrollY },
+      selectedText,
+      {
+        onSave: async ({  }) => {
+          container.remove();
+          currentPopover = null;
+        },
+      }
+    );
+    currentPopover = container;
+  };
+
+  toggleHighlightingMode() {
+    this.isHighlightingModeOn = !this.isHighlightingModeOn;
+    this.statusBarItemEl?.setText(`Highlighting mode: ${this.isHighlightingModeOn}`);
+    new Notice(
+      `Highlighting mode ${this.isHighlightingModeOn ? "enabled" : "disabled"}`
+    );
+  }
+
+  addStatusBarModeIndicator() {
+    this.statusBarItemEl = this.addStatusBarItem();
+    this.statusBarItemEl.setText(`Highlighting mode: ${this.isHighlightingModeOn}`);
+    this.statusBarItemEl.addEventListener("click", () =>
+      this.toggleHighlightingMode()
+    );
+  }
+
+  onunload() {
+    // any popover cleanup
+  }
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
 }
