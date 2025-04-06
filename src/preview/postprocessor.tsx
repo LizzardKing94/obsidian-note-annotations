@@ -10,22 +10,27 @@ interface HighlightMatch {
 	ch: number;
 }
 
-export default (
+/**
+ * This postprocessor scans for ==text==<!--comment--> in the raw file,
+ * then finds the corresponding <mark> elements in the preview. We color them,
+ * attach a title, and attach a click handler that dispatches `omnidian-show-popover`
+ * with the highlight text & coordinates so `main.ts` can open a popover.
+ */
+export default function postprocessor(
 	element: HTMLElement,
 	{ getSectionInfo, addChild }: MarkdownPostProcessorContext
-) => {
+) {
 	const marks = element.findAll("mark");
-
 	if (!marks.length) return;
+
 	const section = getSectionInfo(element);
 	if (!section) return;
 
 	const unprocessedElement = section.text;
-
-	const highlightRegex = /==(.*?)==<!--(.*?)-->/g;
+	const highlightRegex = /==(.*?)==(?:<!--(.*?)-->)?/g;
 	const matches: HighlightMatch[] = [];
-	let match;
 
+	let match;
 	while ((match = highlightRegex.exec(unprocessedElement)) !== null) {
 		const lines = unprocessedElement.slice(0, match.index).split("\n");
 		const line = lines.length - 1;
@@ -51,18 +56,20 @@ export default (
 		if (matchIndex === -1) continue;
 
 		const { comment, line, ch } = matches[matchIndex];
-		matches.splice(matchIndex, 1); // Remove the matched item from the array
+		matches.splice(matchIndex, 1); // remove it from the array
 
-		const matchedColor = matchColor(comment);
+		const matchedColor = comment ? matchColor(comment) : undefined;
 		const cleanComment = comment
-			.trim()
-			.replace(`@${matchedColor ?? ""}`, "")
-			.trim();
+			? comment.trim().replace(`@${matchedColor ?? ""}`, "").trim()
+			: "";
 
-		if (!cleanComment) continue;
+		// if (!cleanComment) continue; // Removed to allow click handling for highlights without comments
 
-		mark.setAttribute("title", cleanComment);
-		mark.addClass("has-comment");
+		if (cleanComment) {
+			mark.setAttribute("title", cleanComment);
+			mark.addClass("has-comment");
+		}
+
 		element.addClass("relative");
 		mark.setAttribute("data-line", line.toString());
 		mark.setAttribute("data-ch", ch.toString());
@@ -71,17 +78,35 @@ export default (
 			mark.style.backgroundColor = matchedColor;
 		}
 
-		// Create React root and render margin note
+		const finalColor = matchedColor ?? null;
 		addChild(
 			new CommentRenderer(
 				element,
 				cleanComment,
 				counter % 2 ? "left" : "right",
 				mark,
-				matchedColor
+				finalColor
 			)
 		);
-
 		counter++;
+
+		mark.addEventListener("click", async (e) => {
+			e.stopPropagation();
+
+			const rect = mark.getBoundingClientRect();
+			const event = new CustomEvent("omnidian-show-popover", {
+				detail: {
+					coords: {
+						x: rect.left + window.scrollX,
+						y: rect.top + window.scrollY,
+					},
+					text: mark.innerText,
+					onSave: null, // Replace 'null' with the correct reference to the onSave function or property
+				},
+				bubbles: true,
+			});
+
+			mark.dispatchEvent(event);
+		});
 	}
-};
+}
